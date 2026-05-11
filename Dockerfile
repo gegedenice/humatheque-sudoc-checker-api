@@ -14,9 +14,9 @@ RUN pip install -U pip && \
 
 COPY . /app
 
-EXPOSE 8002
+EXPOSE 8003
 
 USER appuser
 
-CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port 8002 --workers 1 --timeout-keep-alive 0"]
+CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port 8003 --workers 1 --timeout-keep-alive 0"]
 
