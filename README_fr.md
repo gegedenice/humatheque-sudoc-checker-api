@@ -1,4 +1,4 @@
-# Humatheque Sudoc Check API
+# Humatheque Sudoc Checker API
 
 Service FastAPI permettant de vérifier si des métadonnées de thèse ou de
 mémoire extraites par VLM correspondent déjà à une notice bibliographique du

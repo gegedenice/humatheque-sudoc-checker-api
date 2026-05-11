@@ -1,4 +1,4 @@
-# Humatheque Sudoc Check API
+# Humatheque Sudoc Checker API
 
 FastAPI service for checking whether VLM-extracted thesis or dissertation
 metadata already has a Sudoc bibliographic record.
