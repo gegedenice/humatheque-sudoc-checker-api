@@ -1,14 +1,19 @@
 # Humatheque Sudoc Checker API
 
-FastAPI service for checking whether VLM-extracted thesis or dissertation
-metadata already has a Sudoc bibliographic record.
+FastAPI service for checking whether VLM-extracted academic-document metadata
+already has a Sudoc bibliographic record.
 
-The API is designed for a printed-thesis cataloguing pipeline. It searches all
-Sudoc thesis records via the Sudoc SRU with `tdo=y`, returns both printed/physical and electronic
+The API targets a printed-record cataloguing pipeline. It runs several
+recall-oriented SRU queries, returns both printed/physical and electronic
 candidates, but only printed/physical candidates count toward the duplicate
 decision. Electronic Sudoc/STAR records are kept as evidence because they may
 describe the same intellectual work without blocking creation of a printed
 bibliographic record.
+
+The document-kind specifics (which SRU type predicate to apply, what to require
+in the thesis note) are bundled into reusable `DocumentProfile` strategies, so
+the same pipeline can serve theses, mémoires, and future document profiles
+without per-document forks.
 
 ## Sudoc SRU Strategy
 
@@ -27,9 +32,33 @@ It relies on the ABES SRU guide indexes [https://abes.fr/wp-content/uploads/2023
 | `NTH` | thesis note, including degree, discipline, institution, year |
 | `TDO` | document-type limitation |
 
-`tdo=y` is always added for the thesis/dissertation search space. According to
-the Sudoc SRU guide, `TDO y` covers thesis records across print and electronic
-manifestations, so carrier detection is done after UNIMARC parsing.
+Whether the `TDO` predicate is added depends on the active profile (see below).
+
+## Document profiles
+
+A `DocumentProfile` carries two pieces of state:
+
+- `sru_type_filter` — a CQL fragment appended to every query (or `None` to
+  leave the search space wide open).
+- `note_required_substrings` — substrings that must all appear in the
+  normalized concatenation of UNIMARC 328 (`NTH`) and the other parsed notes
+  of each candidate. Records that do not match are dropped before scoring.
+  Matching is done after NFKD diacritic stripping, so substrings must be
+  lowercase and unaccented (`"memoire"`, not `"Mémoire"`).
+
+Built-in profiles:
+
+| Profile | `sru_type_filter` | `note_required_substrings` | Use case |
+|---|---|---|---|
+| `thesis` | `tdo=y` | _none_ | Doctoral theses flagged TDO=y in Sudoc (default, backward compatible). |
+| `dissertation` | _none_ | `memoire` | Master's mémoires and other dissertations not flagged TDO=y; the NTH content filter keeps the recall noise out. |
+
+The active profile is selected by either the route (`/check/thesis`,
+`/check/dissertation`) or the `profile` field in the request body. Routes
+override the body so clients cannot accidentally mix them.
+
+`GET /profiles` returns the registry, so new profiles can be added in code and
+discovered by clients.
 
 ## Duplicate Logic
 
@@ -85,6 +114,9 @@ curl "http://localhost:8000/sru/search?query=mti%3Dhygiene%20and%20aut%3Dgani%20
 
 ### `POST /check/thesis`
 
+Forces the `thesis` profile (TDO=y, no NTH content requirement). Equivalent to
+`POST /check/document` with `"profile": "thesis"`.
+
 Example:
 
 ```bash
@@ -110,6 +142,19 @@ Response shape:
 ```jsonc
 {
   "source": "sudoc_sru_thesis_check",
+  "profile": {
+    "name": "thesis",
+    "description": "Doctoral thesis records identified by Sudoc TDO=y.",
+    "sru_type_filter": "tdo=y",
+    "note_required_substrings": []
+  },
+  "sru": {
+    "endpoint": "https://www.sudoc.abes.fr/cbs/sru/",
+    "indexes": ["MTI", "AUT", "NTH", "TDO"],
+    "doc_type_filter": "tdo=y",
+    "queries": [/* per-query trace */],
+    "excluded_by_profile_filter": 0
+  },
   "status": "electronic_only",
   "duplicate_score": 0.0,
   "best_print_candidate": null,
@@ -124,6 +169,30 @@ Response shape:
   "candidates": []
 }
 ```
+
+### `POST /check/dissertation`
+
+Forces the `dissertation` profile (no TDO predicate, NTH must contain
+`memoire`). Same request body as `/check/thesis`. Use this for master's
+mémoires and other dissertations Sudoc does not flag with TDO=y:
+
+```bash
+curl -X POST "http://localhost:8000/check/dissertation" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "title": "Représentations du genre dans la presse féminine",
+    "author": "Camille MARTIN",
+    "degree_type": "Mémoire de master recherche 2e année",
+    "discipline": "Sociologie",
+    "granting_institution": "EHESS",
+    "defense_year": 2021,
+    "language": "fre"
+  }'
+```
+
+Response carries the same shape; `profile.name` is `"dissertation"`,
+`sru.doc_type_filter` is `null`, and `sru.excluded_by_profile_filter` reports
+how many SRU hits failed the NTH content rule.
 
 ## Run
 
