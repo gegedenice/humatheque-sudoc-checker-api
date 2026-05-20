@@ -39,13 +39,57 @@ DEFAULT_AMBIGUOUS_THRESHOLD = float(os.getenv("SUDOC_AMBIGUOUS_THRESHOLD", "0.62
 
 SRW_NS = {"srw": "http://www.loc.gov/zing/srw/"}
 
+@dataclass(frozen=True)
+class DocumentProfile:
+    """Strategy bundle that adapts the generic checker to a kind of document.
+
+    `sru_type_filter` is appended verbatim to every CQL query (e.g. `tdo=y` for
+    Sudoc-classified theses). When `None`, no document-type predicate is added,
+    which is the only way to reach Sudoc records that are not flagged TDO=y
+    (notably most master's mémoires).
+
+    `note_required_substrings` are matched against the normalized concatenation
+    of the UNIMARC thesis note (field 328) and the other parsed notes of each
+    candidate. Records that do not contain every substring are dropped before
+    scoring. Matching is done on `normalize_text` output, so substrings must
+    already be lowercased and diacritic-free (e.g. "memoire" not "Mémoire").
+    """
+
+    name: str
+    description: str
+    sru_type_filter: str | None = None
+    note_required_substrings: tuple[str, ...] = ()
+
+
+PROFILES: dict[str, DocumentProfile] = {
+    "thesis": DocumentProfile(
+        name="thesis",
+        description="Doctoral thesis records identified by Sudoc TDO=y.",
+        sru_type_filter="tdo=y",
+        note_required_substrings=(),
+    ),
+    "dissertation": DocumentProfile(
+        name="dissertation",
+        description=(
+            "Master's mémoires and other dissertations that Sudoc does not flag with "
+            "TDO=y. Reached by dropping the document-type predicate and keeping only "
+            "records whose thesis note (UNIMARC 328) mentions 'mémoire'."
+        ),
+        sru_type_filter=None,
+        note_required_substrings=("memoire",),
+    ),
+}
+
+
 app = FastAPI(
     title="Humatheque Sudoc Check API",
-    version="0.1.0",
+    version="0.2.0",
     description=(
-        "Search Sudoc SRU for thesis/dissertation records from VLM-extracted metadata, "
-        "score possible duplicates, and keep electronic-version evidence separate from "
-        "printed-record duplicate decisions."
+        "Search Sudoc SRU for academic records from VLM-extracted metadata, score "
+        "possible duplicates, and keep electronic-version evidence separate from "
+        "printed-record duplicate decisions. Document-kind specifics (TDO filter, "
+        "required note content) are encapsulated in `DocumentProfile` strategies so "
+        "the same pipeline can serve theses, mémoires, and further profiles."
     ),
 )
 
@@ -73,6 +117,16 @@ class SudocCheckRequest(BaseModel):
     committee_members: str | list[str] = Field("", description="Extracted committee members, string or list.")
     language: str = Field("", description="ISO 639-2 language code if available.")
     confidence: float | None = Field(None, ge=0.0, le=1.0)
+
+    profile: str = Field(
+        "thesis",
+        description=(
+            "Document profile key. Selects the SRU type filter (e.g. `tdo=y`) and the "
+            "post-search note filter. Defaults to `thesis` for backward compatibility. "
+            "The `/check/thesis` and `/check/dissertation` routes also force the "
+            "matching profile regardless of this field."
+        ),
+    )
 
     max_records_per_query: int = Field(DEFAULT_MAX_RECORDS_PER_QUERY, ge=1, le=100)
     max_candidates: int = Field(DEFAULT_MAX_CANDIDATES, ge=1, le=100)
@@ -432,7 +486,7 @@ def author_terms(author: str) -> str:
     return " ".join([tokens[0], tokens[-1]])
 
 
-def build_queries(payload: SudocCheckRequest) -> list[str]:
+def build_queries(payload: SudocCheckRequest, profile: DocumentProfile) -> list[str]:
     main_title = title_terms(" ".join([payload.title, payload.subtitle]))
     short_title = title_terms(payload.title, max_terms=4)
     author = author_terms(payload.author)
@@ -449,27 +503,47 @@ def build_queries(payload: SudocCheckRequest) -> list[str]:
             min_len=4,
         )[:6]
     )
+
+    def cql(parts: list[str]) -> str:
+        clauses = list(parts)
+        if profile.sru_type_filter:
+            clauses.append(profile.sru_type_filter)
+        return " and ".join(clauses)
+
     queries = []
     if main_title and author:
-        queries.append(f"mti={main_title} and aut={author} and tdo=y")
+        queries.append(cql([f"mti={main_title}", f"aut={author}"]))
     if short_title and author:
-        queries.append(f"mti={short_title} and aut={author} and tdo=y")
+        queries.append(cql([f"mti={short_title}", f"aut={author}"]))
     if main_title and nth_terms:
-        queries.append(f"mti={main_title} and nth={nth_terms} and tdo=y")
+        queries.append(cql([f"mti={main_title}", f"nth={nth_terms}"]))
     if short_title:
-        queries.append(f"mti={short_title} and tdo=y")
+        queries.append(cql([f"mti={short_title}"]))
     if author and nth_terms:
-        queries.append(f"aut={author} and nth={nth_terms} and tdo=y")
+        queries.append(cql([f"aut={author}", f"nth={nth_terms}"]))
     if nth_terms:
-        queries.append(f"nth={nth_terms} and tdo=y")
+        queries.append(cql([f"nth={nth_terms}"]))
 
     deduped = []
     seen = set()
     for query in queries:
-        if query not in seen:
+        if query and query not in seen:
             seen.add(query)
             deduped.append(query)
     return deduped
+
+
+def matches_profile(record: SudocRecord, profile: DocumentProfile) -> bool:
+    if not profile.note_required_substrings:
+        return True
+    haystack_parts: list[str] = []
+    if record.thesis:
+        for value in record.thesis.values():
+            if value:
+                haystack_parts.append(str(value))
+    haystack_parts.extend(record.notes)
+    haystack = normalize_text(" ".join(haystack_parts))
+    return all(needle in haystack for needle in profile.note_required_substrings)
 
 
 def search_sudoc(
@@ -600,7 +674,14 @@ def status_for_candidates(
 
 
 def check_sudoc(payload: SudocCheckRequest) -> dict[str, Any]:
-    queries = build_queries(payload)
+    profile = PROFILES.get(payload.profile)
+    if profile is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown profile {payload.profile!r}. Available profiles: {sorted(PROFILES)}.",
+        )
+
+    queries = build_queries(payload, profile)
     if not queries:
         raise HTTPException(status_code=400, detail="Unable to build Sudoc query from submitted metadata.")
 
@@ -623,10 +704,18 @@ def check_sudoc(payload: SudocCheckRequest) -> dict[str, Any]:
                 continue
             candidates_by_ppn[record.ppn] = record
 
-    for record in candidates_by_ppn.values():
+    excluded_by_profile = 0
+    accepted_candidates: dict[str, SudocRecord] = {}
+    for ppn, record in candidates_by_ppn.items():
+        if matches_profile(record, profile):
+            accepted_candidates[ppn] = record
+        else:
+            excluded_by_profile += 1
+
+    for record in accepted_candidates.values():
         score_candidate(payload, record)
 
-    ranked = sorted(candidates_by_ppn.values(), key=lambda item: item.score["final"], reverse=True)
+    ranked = sorted(accepted_candidates.values(), key=lambda item: item.score["final"], reverse=True)
     ranked = ranked[: payload.max_candidates]
     status, best_print_candidate, duplicate_score = status_for_candidates(
         ranked,
@@ -635,8 +724,18 @@ def check_sudoc(payload: SudocCheckRequest) -> dict[str, Any]:
     )
     electronic_candidates = [record for record in ranked if record.carrier == "electronic"]
 
+    sru_indexes = ["MTI", "AUT", "NTH"]
+    if profile.sru_type_filter:
+        sru_indexes.append("TDO")
+
     return {
         "source": "sudoc_sru_thesis_check",
+        "profile": {
+            "name": profile.name,
+            "description": profile.description,
+            "sru_type_filter": profile.sru_type_filter,
+            "note_required_substrings": list(profile.note_required_substrings),
+        },
         "query": {
             "title": payload.title,
             "subtitle": payload.subtitle,
@@ -650,9 +749,10 @@ def check_sudoc(payload: SudocCheckRequest) -> dict[str, Any]:
         },
         "sru": {
             "endpoint": SUDOC_SRU_ENDPOINT,
-            "indexes": ["MTI", "AUT", "NTH", "TDO"],
-            "doc_type_filter": "tdo=y",
+            "indexes": sru_indexes,
+            "doc_type_filter": profile.sru_type_filter,
             "queries": searches,
+            "excluded_by_profile_filter": excluded_by_profile,
         },
         "score_weights": {
             "title": 0.42,
@@ -712,11 +812,36 @@ async def sru_search_endpoint(
     }
 
 
+@app.get("/profiles")
+def list_profiles() -> dict[str, Any]:
+    return {
+        "profiles": [
+            {
+                "name": profile.name,
+                "description": profile.description,
+                "sru_type_filter": profile.sru_type_filter,
+                "note_required_substrings": list(profile.note_required_substrings),
+            }
+            for profile in PROFILES.values()
+        ]
+    }
+
+
 @app.post("/check/thesis")
 async def check_thesis_endpoint(
     payload: SudocCheckRequest,
     _: None = Depends(require_api_key),
 ) -> dict[str, Any]:
+    payload.profile = "thesis"
+    return await run_in_threadpool(check_sudoc, payload)
+
+
+@app.post("/check/dissertation")
+async def check_dissertation_endpoint(
+    payload: SudocCheckRequest,
+    _: None = Depends(require_api_key),
+) -> dict[str, Any]:
+    payload.profile = "dissertation"
     return await run_in_threadpool(check_sudoc, payload)
 
 
