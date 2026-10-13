@@ -133,6 +133,7 @@ Forme de réponse :
     "title": "La question de l'hygiène aux Indes-Néerlandaises : les enjeux médicaux,culturels et sociaux.",
     "carrier": "electronic",
     "counts_as_print_duplicate": false,
+	"thesis_state": "electronic",
     "score": {"final": 0.9}
   },
   "candidates": []
