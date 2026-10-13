@@ -39,6 +39,7 @@ DEFAULT_AMBIGUOUS_THRESHOLD = float(os.getenv("SUDOC_AMBIGUOUS_THRESHOLD", "0.62
 
 SRW_NS = {"srw": "http://www.loc.gov/zing/srw/"}
 
+
 @dataclass(frozen=True)
 class DocumentProfile:
     """Strategy bundle that adapts the generic checker to a kind of document.
@@ -156,6 +157,7 @@ class SudocRecord:
     unimarc_xml: str | None = None
     carrier: str = "unknown"
     carrier_evidence: list[str] = field(default_factory=list)
+    thesis_state: str = "unknown"
     matched_queries: list[str] = field(default_factory=list)
     score: dict[str, float] = field(default_factory=dict)
     evidence: dict[str, Any] = field(default_factory=dict)
@@ -397,6 +399,27 @@ def classify_carrier(record: ET.Element) -> tuple[str, list[str]]:
     return "unknown", evidence
 
 
+def classify_thesis_state(record: ET.Element, carrier: str, nnt: str | None) -> str:
+    """Original vs reproduction state; first matching rule wins (electronic before NNT, microfiche before print)."""
+    if carrier == "electronic":
+        return "electronic"
+    field_105_b = "".join(first_subfield(item, "b") or "" for item in field(record, "105"))
+    field_215 = normalize_text(" ".join(value for item in field(record, "215") for value in subfields(item)))
+    is_microform = (
+        any(word in field_215 for word in ("microfiche", "microfilm", "microforme"))
+        or any(value.lower() == "t" for item in field(record, "106") for value in subfields(item, "a"))
+        or any(value.lower().startswith("h") for item in field(record, "183") for value in subfields(item, "a"))
+    )
+    if "v" in field_105_b and is_microform:
+        return "microfiche_reproduction"
+    notes_328 = [normalize_text(" ".join(subfields(item))) for item in field(record, "328")]
+    if "v" in field_105_b or any(note.startswith("reproduction de") for note in notes_328):
+        return "printed_reproduction"
+    if "m" in field_105_b or nnt:
+        return "printed_original"
+    return "unknown"
+
+
 def parse_record(record: ET.Element, include_unimarc_xml: bool = False) -> SudocRecord:
     ppn = control(record, "001") or ""
     thesis = parse_thesis(record)
@@ -421,6 +444,7 @@ def parse_record(record: ET.Element, include_unimarc_xml: bool = False) -> Sudoc
     identifiers = [value for tag in ("017", "029", "035") for item in field(record, tag) for value in subfields(item)]
     notes = statement + [value for tag in ("300", "304", "314", "330") for item in field(record, tag) for value in subfields(item, "a")]
     lang_values = [value for item in field(record, "101") for value in subfields(item, "a")]
+    nnt = first_subfield(field(record, "029")[0], "b") if field(record, "029") else None
 
     return SudocRecord(
         ppn=ppn,
@@ -431,13 +455,14 @@ def parse_record(record: ET.Element, include_unimarc_xml: bool = False) -> Sudoc
         institutions=institutions,
         year=parse_year(record, thesis),
         language=lang_values[0] if lang_values else None,
-        nnt=first_subfield(field(record, "029")[0], "b") if field(record, "029") else None,
+        nnt=nnt,
         thesis=thesis,
         urls=urls,
         identifiers=identifiers,
         notes=notes,
         carrier=carrier,
         carrier_evidence=carrier_evidence,
+        thesis_state=classify_thesis_state(record, carrier, nnt),
         unimarc_xml=ET.tostring(record, encoding="unicode") if include_unimarc_xml else None,
     )
 
@@ -647,6 +672,7 @@ def candidate_to_json(record: SudocRecord, include_unimarc_xml: bool) -> dict[st
         "thesis": record.thesis,
         "carrier": record.carrier,
         "counts_as_print_duplicate": record.carrier != "electronic",
+        "thesis_state": record.thesis_state,
         "urls": record.urls,
         "identifiers": record.identifiers,
         "score": record.score,
@@ -848,4 +874,5 @@ async def check_dissertation_endpoint(
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("app:app", host="0.0.0.0", port=8003)
+    port = int(os.getenv("PORT", "8000"))
+    uvicorn.run("app:app", host="0.0.0.0", port=port)

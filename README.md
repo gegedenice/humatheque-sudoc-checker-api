@@ -87,6 +87,17 @@ Candidate `carrier` is classified as:
 Only candidates whose carrier is not `electronic` are counted as printed
 duplicates.
 
+Each candidate also carries a `thesis_state` (informative only, it does not
+change `status` or `counts_as_print_duplicate`). First matching rule wins:
+
+| `thesis_state` | Rule |
+|---|---|
+| `electronic` | `carrier` is `electronic` (135 / 856 / STAR / online RDA) |
+| `microfiche_reproduction` | 105$b contains `v` AND microform marker: 215 mentions microfiche/microfilm/microforme, 106$a `t`, or 183$a starting with `h` |
+| `printed_reproduction` | 105$b contains `v`, or 328 starts with "Reproduction de" |
+| `printed_original` | 105$b contains `m`, or NNT present (029$b) |
+| `unknown` | none of the above |
+
 Statuses:
 
 | Status | Meaning |

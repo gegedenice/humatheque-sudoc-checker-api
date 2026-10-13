@@ -61,6 +61,17 @@ Le champ `carrier` d'un candidat est classé ainsi :
 Seuls les candidats dont le `carrier` n'est pas `electronic` sont comptés comme
 doublons imprimés.
 
+Chaque candidat contient aussi un `thesis_state` (seulement informatif, pas d'impact sur
+`status` ou `counts_as_print_duplicate`). La première règle qui matche fait foi :
+
+| `thesis_state` | Règle |
+|---|---|
+| `electronic` | Le champ `carrier` est `electronic` (135 / 856 / STAR / online RDA) |
+| `microfiche_reproduction` | 105$b contient `v` ET un marqueur de microforme : 215 mentionne microfiche/microfilm/microforme, 106$a `t`, ou 183$a commence par `h` |
+| `printed_reproduction` | 105$b contient `v`, ou 328 commence par "Reproduction de" |
+| `printed_original` | 105$b contient `m`, ou NNT présent (029$b) |
+| `unknown` | aucun des cas ci-dessus |
+
 Statuts :
 
 | Statut | Signification |
